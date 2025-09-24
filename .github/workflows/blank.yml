@@ -1,0 +1,32 @@
+name: HTML to AsciiDoc Conversion
+
+on:
+  push:
+    paths:
+      - '**/*.html'
+
+jobs:
+  convert-html-to-adoc:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install Pandoc
+      run: sudo apt-get update && sudo apt-get install -y pandoc
+
+    - name: Convert HTML to AsciiDoc
+      run: |
+        for file in $(find . -name "*.html"); do
+          adoc_file="${file%.html}.adoc"
+          pandoc "$file" -f html -t asciidoc -o "$adoc_file"
+        done
+
+    - name: Commit converted AsciiDoc files
+      run: |
+        git config --global user.name "github-actions"
+        git config --global user.email "github-actions@github.com"
+        git add *.adoc
+        git commit -m "Auto-converted HTML to AsciiDoc"
+        git push
