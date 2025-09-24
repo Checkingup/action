@@ -23,10 +23,13 @@ jobs:
           pandoc "$file" -f html -t asciidoc -o "$adoc_file"
         done
 
+    - name: Check Git Status
+      run: git status
+
     - name: Commit converted AsciiDoc files
       run: |
         git config --global user.name "github-actions"
         git config --global user.email "github-actions@github.com"
-        git add *.adoc
-        git commit -m "Auto-converted HTML to AsciiDoc"
+        git add *.adoc || true
+        git commit -m "Auto-converted HTML to AsciiDoc" || echo "No changes to commit"
         git push
