@@ -1,0 +1,9 @@
+page:
+  background-color: #F5F5F5  # Hellgrau
+  background-image: image:hintergrund.png[]
+  layout: portrait
+  margin: [1in, 1in, 1in, 1in]
+
+base:
+  font-color: #333333
+  font-size: 12
