@@ -1,0 +1,234 @@
+name: TSV to GitHub Project (v2)
+
+on:
+  push:
+    paths:
+      - 'data/**/*.tsv'
+  workflow_dispatch:
+
+permissions:
+  contents: read       # TSVs lesen
+  projects: write      # Project v2 schreiben
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    env:
+      ORG: "deine-org"          # <-- anpassen: Organisations-Login
+      PROJECT_NUMBER: "8"       # <-- anpassen: Projektnummer (z.B. 8)
+      TSV_GLOB: "data/**/*.tsv"
+      TITLE_COL: "Document Name"        # <-- Titel-Feld für das Project-Item
+      UNIQUE_COLS: "Document Name"      # <-- Spaltenliste, die die Zeile eindeutig macht (Komma-getrennt)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Create importer script
+        shell: bash
+        run: |
+          mkdir -p scripts
+          cat > scripts/tsv_to_project_v2.py << 'PY'
+          import os, glob, hashlib, sys
+          import requests
+          import pandas as pd
+
+          GQL = "https://api.github.com/graphql"
+          TOKEN = os.getenv("GITHUB_TOKEN")
+          ORG = os.getenv("ORG")
+          PROJECT_NUMBER = int(os.getenv("PROJECT_NUMBER"))
+          TSV_GLOB = os.getenv("TSV_GLOB", "data/**/*.tsv")
+          TITLE_COL = os.getenv("TITLE_COL", "Document Name")
+          UNIQUE_COLS = [c.strip() for c in os.getenv("UNIQUE_COLS", "Document Name").split(",")]
+
+          HEADERS = {
+              "Authorization": f"Bearer {TOKEN}",
+              "Accept": "application/vnd.github+json",
+          }
+
+          def gql(query: str, variables: dict):
+              r = requests.post(GQL, headers=HEADERS, json={"query": query, "variables": variables}, timeout=60)
+              r.raise_for_status()
+              j = r.json()
+              if "errors" in j:
+                  raise RuntimeError(j["errors"])
+              return j["data"]
+
+          def get_project_and_fields():
+              q = """
+              query($org:String!, $number:Int!) {
+                organization(login:$org) {
+                  projectV2(number:$number) {
+                    id
+                    fields(first: 100) {
+                      nodes {
+                        ... on ProjectV2FieldCommon { id name dataType }
+                      }
+                    }
+                  }
+                }
+              }"""
+              data = gql(q, {"org": ORG, "number": PROJECT_NUMBER})
+              proj = data["organization"]["projectV2"]
+              if not proj:
+                  raise RuntimeError(f"Project {PROJECT_NUMBER} in org '{ORG}' nicht gefunden.")
+              project_id = proj["id"]
+              fields = {f["name"]: f for f in proj["fields"]["nodes"]}
+              return project_id, fields
+
+          def create_field_if_missing(project_id, fields, name, data_type="TEXT"):
+              if name in fields:
+                  return fields[name]["id"], fields
+              q = """
+              mutation($projectId:ID!, $name:String!, $dataType:ProjectV2CustomFieldType!) {
+                createProjectV2Field(input:{projectId:$projectId, name:$name, dataType:$dataType}) {
+                  projectV2Field { ... on ProjectV2FieldCommon { id name dataType } }
+                }
+              }"""
+              d = gql(q, {"projectId": project_id, "name": name, "dataType": data_type})
+              f = d["createProjectV2Field"]["projectV2Field"]
+              fields[f["name"]] = f
+              return f["id"], fields
+
+          def list_existing_items_by_key(project_id, key_field_name="tsv-key"):
+              """
+              Lädt alle Items des Projects (paginiert) und baut ein Mapping:
+              { <tsv-key text>: <item_id> }
+              """
+              mapping = {}
+              after = None
+              while True:
+                  q = """
+                  query($projectId:ID!, $after:String) {
+                    node(id:$projectId) {
+                      ... on ProjectV2 {
+                        items(first: 100, after: $after) {
+                          nodes {
+                            id
+                            fieldValueByName(name: "tsv-key") {
+                              __typename
+                              ... on ProjectV2ItemFieldTextValue { text }
+                            }
+                          }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }"""
+                  data = gql(q, {"projectId": project_id, "after": after})
+                  items = data["node"]["items"]["nodes"]
+                  for it in items:
+                      fv = it.get("fieldValueByName")
+                      if fv and fv.get("__typename") == "ProjectV2ItemFieldTextValue":
+                          key_text = fv.get("text") or ""
+                          if key_text:
+                              mapping[key_text] = it["id"]
+                  pi = data["node"]["items"]["pageInfo"]
+                  if not pi["hasNextPage"]:
+                      break
+                  after = pi["endCursor"]
+              return mapping
+
+          def add_draft_item(project_id, title, body_marker):
+              q = """
+              mutation($projectId:ID!, $title:String!, $body:String!) {
+                addProjectV2DraftIssue(input:{projectId:$projectId, title:$title, body:$body}) {
+                  projectItem { id }
+                }
+              }"""
+              d = gql(q, {"projectId": project_id, "title": title, "body": body_marker})
+              return d["addProjectV2DraftIssue"]["projectItem"]["id"]
+
+          def set_text_field(project_id, item_id, field_id, text):
+              q = """
+              mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $value:String!) {
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$projectId, itemId:$itemId, fieldId:$fieldId,
+                  value:{ text: $value }
+                }) { projectV2Item { id } }
+              }"""
+              gql(q, {"projectId": project_id, "itemId": item_id, "fieldId": field_id, "value": text or ""})
+
+          def row_key(row: pd.Series) -> str:
+              s = "||".join(str(row.get(c, "")) for c in UNIQUE_COLS)
+              return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+          def main():
+              if not TOKEN:
+                  raise SystemExit("GITHUB_TOKEN fehlt.")
+              project_id, fields = get_project_and_fields()
+
+              # Stelle sicher, dass 'tsv-key' Feld existiert
+              key_field_id, fields = create_field_if_missing(project_id, fields, "tsv-key", "TEXT")
+
+              # Mapping existierender Items nach key laden
+              existing = list_existing_items_by_key(project_id)
+              print(f"Gefundene Items mit tsv-key: {len(existing)}")
+
+              tsv_files = glob.glob(TSV_GLOB, recursive=True)
+              if not tsv_files:
+                  print("Keine TSV-Dateien gefunden.")
+                  return
+
+              # Für jede TSV: fehlende Spaltenfelder (Text) anlegen
+              col_field_ids = {}   # {col_name: field_id}
+
+              # 1. Pass: alle Spalten sammeln
+              all_cols = set()
+              frames = []
+              for path in tsv_files:
+                  df = pd.read_csv(path, sep="\\t", dtype=str).fillna("")
+                  frames.append((path, df))
+                  all_cols.update(df.columns.tolist())
+
+              # Felder für alle Spalten sicherstellen
+              for col in sorted(all_cols):
+                  fid, fields = create_field_if_missing(project_id, fields, col, "TEXT")
+                  col_field_ids[col] = fid
+
+              # 2. Pass: Zeilen verarbeiten
+              created, updated = 0, 0
+              for path, df in frames:
+                  print(f"Verarbeite {path} (rows={len(df)})")
+                  for _, row in df.iterrows():
+                      key = row_key(row)
+                      title = row.get(TITLE_COL, "") or f"Item {key[:8]}"
+                      marker = f"[tsv-key:{key}]"
+
+                      item_id = existing.get(key)
+                      if not item_id:
+                          # neu anlegen als Draft-Item
+                          item_id = add_draft_item(project_id, title, marker)
+                          existing[key] = item_id
+                          created += 1
+                      else:
+                          updated += 1
+
+                      # Werte für alle Spalten setzen
+                      for col in df.columns:
+                          set_text_field(project_id, item_id, col_field_ids[col], str(row[col]))
+
+                      # Auch den 'tsv-key' im Feld setzen (Idempotenz)
+                      set_text_field(project_id, item_id, key_field_id, key)
+
+              print(f"Fertig: created={created}, updated={updated}")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run importer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/tsv_to_project_v2.py
